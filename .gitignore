@@ -1,0 +1,31 @@
+# Config files with user settings
+config.json
+
+# CSV backups contain sensitive recovery codes
+*.csv
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Temp files
+*.tmp
+*.bak
+nul
+
+# Local-only docs with sensitive information
+docs-local-only/
+
+# Encryption keys and credentials
+*_keys.json
+*.unifi
+
+# Binary test files
+*.bin
+
+# Search/debug outputs
+*_results.txt

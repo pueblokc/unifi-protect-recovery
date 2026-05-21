@@ -1,0 +1,46 @@
++------------------------------------------------------------------+
+|     UniFi Protect Recovery Codes - Quick Reference Card          |
++------------------------------------------------------------------+
+
+  Point-and-click instead?  ->  Double-click RUN_BACKUP_GUI.bat
+                                 (or run UniFi-Protect-Backup.ps1)
+
+------------------------------------------------------------------
+ SERVER-SIDE COMMANDS  (run these ON the NVR over SSH)
+------------------------------------------------------------------
+
+ Get all recovery codes (text):
+   python3 extract_recovery_codes.py
+
+ Export to CSV (opens nicely in Excel):
+   python3 extract_recovery_codes.py /path/to/backup.zip csv
+
+ Create a dated backup (extract + retention):
+   bash backup_recovery_codes.sh
+
+ View the latest CSV:
+   cat /root/unifi_protect_recovery_backups/recovery_codes_latest.csv
+
+ Search for one device:
+   grep -i "Front Door" /root/unifi_protect_recovery_backups/recovery_codes_latest.csv
+
+------------------------------------------------------------------
+ FILE LOCATIONS
+------------------------------------------------------------------
+   UniFi backups:    /srv/unifi-protect/backups/
+   Recovery CSVs:    /root/unifi_protect_recovery_backups/
+   Latest CSV:       /root/unifi_protect_recovery_backups/recovery_codes_latest.csv
+
+------------------------------------------------------------------
+ OPTIONAL: daily automated backup at 1 AM
+------------------------------------------------------------------
+   echo "0 1 * * * /root/backup_recovery_codes.sh >> /var/log/recovery_backup.log 2>&1" | crontab -
+
+------------------------------------------------------------------
+ SECURITY: recovery codes = full device-adoption access.
+ Treat the CSV like a password file. Never commit a real one.
+------------------------------------------------------------------
+  (Example device names/paths above are placeholders.)
+------------------------------------------------------------------
+   # (c) 2026 KCCS  -  kccsonline.com  -  MIT License
+------------------------------------------------------------------

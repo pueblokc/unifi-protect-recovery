@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Monitor body -->
+  <rect x="10" y="8" width="44" height="32" rx="3" fill="#1e1e2e" stroke="#89b4fa" stroke-width="2"/>
+  <!-- Screen -->
+  <rect x="14" y="12" width="36" height="24" rx="1" fill="#181825"/>
+  <!-- Screen glow line -->
+  <line x1="16" y1="20" x2="34" y2="20" stroke="#a6e3a1" stroke-width="2" stroke-linecap="round"/>
+  <line x1="16" y1="25" x2="28" y2="25" stroke="#89b4fa" stroke-width="2" stroke-linecap="round"/>
+  <line x1="16" y1="30" x2="40" y2="30" stroke="#f38ba8" stroke-width="2" stroke-linecap="round"/>
+  <!-- Cursor blink -->
+  <rect x="36" y="19" width="2" height="3" fill="#a6e3a1">
+    <animate attributeName="opacity" values="1;0;1" dur="1s" repeatCount="indefinite"/>
+  </rect>
+  <!-- Monitor stand -->
+  <rect x="27" y="40" width="10" height="4" fill="#585b70"/>
+  <rect x="22" y="44" width="20" height="3" rx="1" fill="#585b70"/>
+  <!-- Sunglasses on monitor (the funny part) -->
+  <ellipse cx="25" cy="16" rx="5" ry="3" fill="#11111b" stroke="#cdd6f4" stroke-width="1"/>
+  <ellipse cx="39" cy="16" rx="5" ry="3" fill="#11111b" stroke="#cdd6f4" stroke-width="1"/>
+  <line x1="30" y1="16" x2="34" y2="16" stroke="#cdd6f4" stroke-width="1"/>
+  <!-- Tiny smirk under glasses -->
+  <path d="M28 18.5 Q32 21 36 18.5" fill="none" stroke="#f9e2af" stroke-width="1" stroke-linecap="round"/>
+  <!-- Keyboard sparkle -->
+  <circle cx="52" cy="48" r="2" fill="#f9e2af" opacity="0.6">
+    <animate attributeName="opacity" values="0.6;1;0.6" dur="2s" repeatCount="indefinite"/>
+  </circle>
+</svg>
