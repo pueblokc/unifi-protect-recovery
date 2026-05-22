@@ -17,70 +17,49 @@ import zipfile
 import os
 from datetime import datetime
 
-def extract_recovery_codes(backup_file):
-    """Extract recovery codes from a UniFi Protect backup ZIP file"""
-    
-    devices = {
-        'cameras': [],
-        'bridges': [],
-        'lights': [],
-        'speakers': []
+# Every adoptable UniFi Protect device stores its recovery code in the
+# "password" field of its per-type JSON file inside the backup ZIP. Keep this
+# list complete — a missing entry silently drops those devices' recovery codes.
+DEVICE_FILES = {
+    'cameras':  'cameras.json',
+    'bridges':  'bridges.json',
+    'lights':   'lights.json',
+    'speakers': 'speakers.json',
+    'aiports':  'aiports.json',
+    'sirens':   'sirens.json',
+    'viewers':  'viewers.json',
+}
+
+
+def device_record(d):
+    """Build a normalized recovery record. `or` (not dict default) so empty
+    strings fall back too — e.g. bridges often have an empty `host`."""
+    return {
+        'name': d.get('name') or 'Unknown',
+        'model': d.get('type') or 'Unknown',
+        'mac': d.get('mac') or 'N/A',
+        'ip': d.get('host') or 'N/A',
+        'recovery_code': d.get('password') or 'N/A',
     }
-    
+
+
+def extract_recovery_codes(backup_file):
+    """Extract recovery codes for every device type in a Protect backup ZIP"""
+
+    devices = {k: [] for k in DEVICE_FILES}
+
     try:
         with zipfile.ZipFile(backup_file, 'r') as zip_ref:
-            # Extract cameras
-            if 'cameras.json' in zip_ref.namelist():
-                cameras_data = json.loads(zip_ref.read('cameras.json'))
-                for cam in cameras_data:
-                    devices['cameras'].append({
-                        'name': cam.get('name', 'Unknown'),
-                        'model': cam.get('type', 'Unknown'),
-                        'mac': cam.get('mac', 'N/A'),
-                        'ip': cam.get('host', 'N/A'),
-                        'recovery_code': cam.get('password', 'N/A')
-                    })
-            
-            # Extract bridges
-            if 'bridges.json' in zip_ref.namelist():
-                bridges_data = json.loads(zip_ref.read('bridges.json'))
-                for bridge in bridges_data:
-                    devices['bridges'].append({
-                        'name': bridge.get('name', 'Unknown'),
-                        'model': bridge.get('type', 'Unknown'),
-                        'mac': bridge.get('mac', 'N/A'),
-                        'ip': bridge.get('host', 'N/A'),
-                        'recovery_code': bridge.get('password', 'N/A')
-                    })
-            
-            # Extract lights
-            if 'lights.json' in zip_ref.namelist():
-                lights_data = json.loads(zip_ref.read('lights.json'))
-                for light in lights_data:
-                    devices['lights'].append({
-                        'name': light.get('name', 'Unknown'),
-                        'model': light.get('type', 'Unknown'),
-                        'mac': light.get('mac', 'N/A'),
-                        'ip': light.get('host', 'N/A'),
-                        'recovery_code': light.get('password', 'N/A')
-                    })
-            
-            # Extract speakers
-            if 'speakers.json' in zip_ref.namelist():
-                speakers_data = json.loads(zip_ref.read('speakers.json'))
-                for speaker in speakers_data:
-                    devices['speakers'].append({
-                        'name': speaker.get('name', 'Unknown'),
-                        'model': speaker.get('type', 'Unknown'),
-                        'mac': speaker.get('mac', 'N/A'),
-                        'ip': speaker.get('host', 'N/A'),
-                        'recovery_code': speaker.get('password', 'N/A')
-                    })
-                    
+            names = zip_ref.namelist()
+            for dtype, fname in DEVICE_FILES.items():
+                if fname not in names:
+                    continue
+                for d in json.loads(zip_ref.read(fname)):
+                    devices[dtype].append(device_record(d))
     except Exception as e:
         print(f'Error reading backup file: {e}', file=sys.stderr)
         return None
-    
+
     return devices
 
 def print_recovery_codes(devices, output_format='text'):
@@ -115,7 +94,7 @@ def save_to_csv(devices, output_file):
     """Save recovery codes to CSV file"""
     import csv
     
-    with open(output_file, 'w', newline='') as csvfile:
+    with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
         fieldnames = ['Type', 'Name', 'Model', 'MAC', 'IP', 'Recovery Code']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         

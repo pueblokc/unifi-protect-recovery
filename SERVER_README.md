@@ -96,9 +96,12 @@ Each backup ZIP contains JSON files with device configuration:
 | File | Contents |
 |------|----------|
 | `cameras.json` | Camera configs + recovery codes |
-| `bridges.json` | Bridge / sensor configs |
-| `lights.json` | Light configs |
-| `speakers.json` | Speaker configs |
+| `bridges.json` | Bridge / sensor configs + recovery codes |
+| `lights.json` | Light configs + recovery codes |
+| `speakers.json` | Speaker configs + recovery codes |
+| `aiports.json` | AI Port configs + recovery codes |
+| `sirens.json` | Siren configs + recovery codes |
+| `viewers.json` | Viewport configs + recovery codes |
 | `nvr.json` | NVR configuration |
 | `users.json` | User configurations |
 | `liveviews.json` | Live view layouts |

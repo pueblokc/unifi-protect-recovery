@@ -31,7 +31,8 @@
 
 ## Why you want this
 
-Every UniFi Protect camera, bridge, light, and speaker has a **recovery code** —
+Every UniFi Protect device — cameras, bridges, lights, speakers, AI Ports,
+sirens, and viewers — has a **recovery code** —
 a per-device password buried inside your NVR's nightly backup. You almost never
 think about it... until the day a device won't re-adopt after a factory reset, or
 you're migrating to a new controller, and UniFi asks for a code you've never seen.
@@ -104,9 +105,10 @@ python3 extract_recovery_codes.py /path/to/backup.zip json # export to JSON
 ```
  1. UniFi Protect writes an automatic backup .zip nightly (~00:00)
  2. This tool SSHes in and finds the most recent backup
-        ↳ checks /srv/unifi-protect/backups, /data/unifi-core/backups, …
+        ↳ probes /srv/unifi-protect/backups, /etc/unifi-protect/backups,
+          /data/unifi-core/backups, /data/unifi-protect/backups
  3. Downloads it to a temp file
- 4. Reads cameras.json / bridges.json / lights.json / speakers.json
+ 4. Reads cameras / bridges / lights / speakers / aiports / sirens / viewers .json
         ↳ each device's recovery code lives in its "password" field
  5. Writes recovery_codes_<timestamp>.csv  ──►  your Save-To folder
  6. Deletes the temp backup. Nothing is uploaded anywhere.

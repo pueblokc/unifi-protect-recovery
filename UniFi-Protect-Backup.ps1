@@ -16,6 +16,11 @@ $pscpPath = Get-Command pscp -ErrorAction SilentlyContinue
 # Configuration file
 $configFile = Join-Path $PSScriptRoot "config.json"
 
+# Every adoptable UniFi Protect device keeps its recovery code in the "password"
+# field of its per-type JSON file inside the backup ZIP. Keep this list complete
+# or those devices' recovery codes get silently dropped.
+$script:DeviceTypes = @('cameras', 'bridges', 'lights', 'speakers', 'aiports', 'sirens', 'viewers')
+
 # Load saved config
 function Load-Config {
     if (Test-Path $configFile) {
@@ -44,19 +49,16 @@ function Save-Config {
 function Extract-RecoveryCodes {
     param($zipPath)
 
-    $devices = @{
-        cameras = @()
-        bridges = @()
-        lights = @()
-        speakers = @()
-    }
+    $devices = @{}
+    foreach ($t in $script:DeviceTypes) { $devices[$t] = @() }
+    $validNames = $script:DeviceTypes | ForEach-Object { "$_" + ".json" }
 
     try {
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
 
         foreach ($entry in $zip.Entries) {
-            if ($entry.Name -in @('cameras.json', 'bridges.json', 'lights.json', 'speakers.json')) {
+            if ($entry.Name -in $validNames) {
                 $stream = $entry.Open()
                 $reader = New-Object System.IO.StreamReader($stream)
                 $json = $reader.ReadToEnd()
@@ -92,7 +94,7 @@ function Save-ToCSV {
     $rows = @()
     $rows += "Type,Name,Model,MAC,IP,Recovery Code"
 
-    foreach ($type in @('cameras', 'bridges', 'lights', 'speakers')) {
+    foreach ($type in $script:DeviceTypes) {
         foreach ($device in $devices[$type]) {
             $typeName = $type.TrimEnd('s')
             $typeName = $typeName.Substring(0,1).ToUpper() + $typeName.Substring(1)
@@ -361,7 +363,8 @@ $testBtn.Add_Click({
             Update-Status "Connected, but no backups found" ([System.Drawing.Color]::Orange)
             Log-Message ""
             Log-Message "No backup files found in any common location."
-            [System.Windows.Forms.MessageBox]::Show("Connected, but no backup ZIP files found.`n`nTried paths:`n- /srv/unifi-protect/backups`n- /etc/unifi-protect/backups`n- /data/unifi-core/backups`n`nMake sure automatic backups are enabled in UniFi Protect.", "Warning", "OK", "Warning")
+            $triedList = ($backupPaths | ForEach-Object { "- $_" }) -join "`n"
+            [System.Windows.Forms.MessageBox]::Show("Connected, but no backup ZIP files were found.`n`nPaths checked:`n$triedList`n`nMost likely automatic backups are not enabled yet. In the UniFi Protect web UI go to:`n  Settings -> System -> Backups`nenable Automatic Backups, then wait for the nightly run (~midnight). If your console stores backups elsewhere, enter that path above and test again.", "No backups found", "OK", "Warning")
         }
     } catch {
         Log-Message "ERROR: $_"
@@ -461,19 +464,20 @@ $backupBtn.Add_Click({
         # Clean up temp
         Remove-Item $tempZip -Force -ErrorAction SilentlyContinue
 
-        # Count devices
-        $camCount = $devices.cameras.Count
-        $bridgeCount = $devices.bridges.Count
-        $lightCount = $devices.lights.Count
-        $speakerCount = $devices.speakers.Count
-        $total = $camCount + $bridgeCount + $lightCount + $speakerCount
-
+        # Count devices generically across every known device type
+        $total = 0
+        $breakdownLines = @()
         Log-Message ""
         Log-Message "Devices found:"
-        if ($camCount -gt 0) { Log-Message "  Cameras: $camCount" }
-        if ($bridgeCount -gt 0) { Log-Message "  Bridges: $bridgeCount" }
-        if ($lightCount -gt 0) { Log-Message "  Lights: $lightCount" }
-        if ($speakerCount -gt 0) { Log-Message "  Speakers: $speakerCount" }
+        foreach ($t in $script:DeviceTypes) {
+            $c = $devices[$t].Count
+            $total += $c
+            if ($c -gt 0) {
+                $label = $t.Substring(0,1).ToUpper() + $t.Substring(1)
+                Log-Message "  ${label}: $c"
+                $breakdownLines += "- ${label}: $c"
+            }
+        }
         Log-Message "  Total: $total"
 
         # Get NVR hostname and MAC for filename
@@ -522,7 +526,7 @@ $backupBtn.Add_Click({
         Update-Status "Backup complete! $total devices saved." ([System.Drawing.Color]::Green)
 
         [System.Windows.Forms.MessageBox]::Show(
-            "Successfully backed up recovery codes!`n`nTotal devices: $total`n- Cameras: $camCount`n- Bridges: $bridgeCount`n- Lights: $lightCount`n- Speakers: $speakerCount`n`nSaved to:`n$outputFile",
+            "Successfully backed up recovery codes!`n`nTotal devices: $total`n$($breakdownLines -join "`n")`n`nSaved to:`n$outputFile",
             "Backup Complete", "OK", "Information")
 
     } catch {

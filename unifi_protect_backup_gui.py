@@ -37,6 +37,41 @@ except ImportError:
 CONFIG_FILE = Path(__file__).parent / "config.json"
 DEFAULT_BACKUP_PATH = "/srv/unifi-protect/backups"
 
+# UniFi Protect writes its automatic backups to different locations depending on
+# the console model and firmware. We probe the user-supplied path first, then
+# fall back through these known locations (verified on UNVR / UniFi OS consoles).
+CANDIDATE_BACKUP_PATHS = [
+    "/srv/unifi-protect/backups",
+    "/etc/unifi-protect/backups",
+    "/data/unifi-core/backups",
+    "/data/unifi-protect/backups",
+]
+
+# Every adoptable UniFi Protect device stores its recovery code in the
+# "password" field of its per-type JSON file inside the backup ZIP. Keep this
+# list complete — a missing entry silently drops those devices' recovery codes.
+DEVICE_FILES = {
+    'cameras':  'cameras.json',
+    'bridges':  'bridges.json',
+    'lights':   'lights.json',
+    'speakers': 'speakers.json',
+    'aiports':  'aiports.json',
+    'sirens':   'sirens.json',
+    'viewers':  'viewers.json',
+}
+
+
+def device_record(d):
+    """Build a normalized recovery record. `or` (not dict default) so empty
+    strings fall back too — e.g. bridges often have an empty `host`."""
+    return {
+        'name': d.get('name') or 'Unknown',
+        'model': d.get('type') or 'Unknown',
+        'mac': d.get('mac') or 'N/A',
+        'ip': d.get('host') or 'N/A',
+        'recovery_code': d.get('password') or 'N/A',
+    }
+
 
 class UniFiProtectBackupGUI:
     def __init__(self, root):
@@ -56,12 +91,7 @@ class UniFiProtectBackupGUI:
 
         # Status tracking
         self.is_running = False
-        self.devices_found = {
-            'cameras': 0,
-            'bridges': 0,
-            'lights': 0,
-            'speakers': 0
-        }
+        self.devices_found = {k: 0 for k in DEVICE_FILES}
 
         # Load saved configuration
         self.load_config()
@@ -331,6 +361,37 @@ class UniFiProtectBackupGUI:
         thread.daemon = True
         thread.start()
 
+    def _candidate_paths(self, configured_path):
+        """Configured path first, then the known fallback locations (de-duped)."""
+        paths = []
+        if configured_path:
+            paths.append(configured_path)
+        for p in CANDIDATE_BACKUP_PATHS:
+            if p not in paths:
+                paths.append(p)
+        return paths
+
+    def _find_backup_dir(self, sftp, configured_path):
+        """Probe the configured path, then fall back through known locations.
+
+        Returns (path, zip_files):
+          - (path, [..zips..]) when a directory containing .zip backups is found
+          - (first_existing_dir, [])  when a backup dir exists but holds no zips
+          - (None, [])  when none of the candidate directories exist at all
+        """
+        first_existing = None
+        for path in self._candidate_paths(configured_path):
+            try:
+                files = sftp.listdir(path)
+            except IOError:
+                continue  # directory does not exist on this console; try next
+            if first_existing is None:
+                first_existing = path
+            zip_files = sorted([f for f in files if f.endswith('.zip')])
+            if zip_files:
+                return path, zip_files
+        return first_existing, []
+
     def _test_connection_thread(self):
         """Background thread for connection test"""
         try:
@@ -344,40 +405,58 @@ class UniFiProtectBackupGUI:
                 timeout=10
             )
 
-            # Test if backup directory exists
+            # Probe the configured path, then known fallback locations
             sftp = ssh.open_sftp()
-            backup_path = self.backup_path.get().strip()
+            configured = self.backup_path.get().strip()
+            tried = self._candidate_paths(configured)
+
+            self.root.after(0, lambda: self.log_message(f"Connected to {self.nvr_ip.get()}"))
 
             try:
-                files = sftp.listdir(backup_path)
-                zip_files = [f for f in files if f.endswith('.zip')]
-
-                self.root.after(0, lambda: self.log_message(f"Connected to {self.nvr_ip.get()}"))
-                self.root.after(0, lambda: self.log_message(f"Backup directory: {backup_path}"))
-                self.root.after(0, lambda: self.log_message(f"Found {len(zip_files)} backup file(s)"))
+                found_path, zip_files = self._find_backup_dir(sftp, configured)
 
                 if zip_files:
-                    latest = sorted(zip_files)[-1]
-                    self.root.after(0, lambda: self.log_message(f"Latest backup: {latest}"))
+                    latest = zip_files[-1]
+                    if found_path != configured:
+                        # Found backups somewhere other than the configured path
+                        self.root.after(0, lambda fp=found_path: self.backup_path.set(fp))
+                        self.root.after(0, lambda fp=found_path: self.log_message(
+                            f"Backups found in {fp} (path updated)"))
+                    self.root.after(0, lambda fp=found_path: self.log_message(f"Backup directory: {fp}"))
+                    self.root.after(0, lambda n=len(zip_files): self.log_message(f"Found {n} backup file(s)"))
+                    self.root.after(0, lambda l=latest: self.log_message(f"Latest backup: {l}"))
                     self.root.after(0, lambda: self.update_status("Connection successful!", "green"))
-                    self.root.after(0, lambda: messagebox.showinfo(
+                    self.root.after(0, lambda fp=found_path, n=len(zip_files), l=latest: messagebox.showinfo(
                         "Success",
-                        f"Connection successful!\n\nFound {len(zip_files)} backup file(s)\nLatest: {latest}"
+                        f"Connection successful!\n\nFound {n} backup file(s) in:\n{fp}\nLatest: {l}"
+                    ))
+                elif found_path is not None:
+                    # A backup directory exists but contains no .zip files
+                    self.root.after(0, lambda: self.update_status("Connected, but no backups found", "orange"))
+                    self.root.after(0, lambda fp=found_path: self.log_message(
+                        f"Backup directory {fp} exists but contains no .zip files"))
+                    self.root.after(0, lambda t=tried: messagebox.showwarning(
+                        "No backups found",
+                        "Connected successfully, but no backup ZIP files were found.\n\n"
+                        "Paths checked:\n  " + "\n  ".join(t) + "\n\n"
+                        "Most likely automatic backups are not enabled yet. In the UniFi "
+                        "Protect web UI go to:\n"
+                        "  Settings -> System -> Backups\n"
+                        "enable Automatic Backups, then wait for the nightly run (~midnight)."
                     ))
                 else:
-                    self.root.after(0, lambda: self.update_status("Connected, but no backups found", "orange"))
-                    self.root.after(0, lambda: messagebox.showwarning(
-                        "Warning",
-                        "Connected successfully, but no backup ZIP files found.\n\n"
-                        "Make sure automatic backups are enabled in UniFi Protect."
+                    # None of the candidate directories exist on this console
+                    self.root.after(0, lambda: self.update_status("Backup directory not found", "red"))
+                    self.root.after(0, lambda t=tried: self.log_message(
+                        "No backup directory found. Checked: " + ", ".join(t)))
+                    self.root.after(0, lambda t=tried: messagebox.showerror(
+                        "Backup directory not found",
+                        "Connected, but no UniFi Protect backup directory was found.\n\n"
+                        "Paths checked:\n  " + "\n  ".join(t) + "\n\n"
+                        "If your console stores backups elsewhere, set the correct path in "
+                        "the 'Backup path' field. Otherwise enable Automatic Backups under "
+                        "Settings -> System -> Backups in the Protect UI."
                     ))
-            except FileNotFoundError:
-                self.root.after(0, lambda: self.update_status("Backup directory not found", "red"))
-                self.root.after(0, lambda: messagebox.showerror(
-                    "Error",
-                    f"Backup directory not found: {backup_path}\n\n"
-                    "Please check the backup path setting."
-                ))
             finally:
                 sftp.close()
                 ssh.close()
@@ -433,15 +512,23 @@ class UniFiProtectBackupGUI:
 
             self.root.after(0, lambda: self.log_message(f"Connected to {self.nvr_ip.get()}"))
 
-            # Find latest backup
+            # Find latest backup (probe configured path, then known locations)
             sftp = ssh.open_sftp()
-            backup_path = self.backup_path.get().strip()
-
-            files = sftp.listdir(backup_path)
-            zip_files = sorted([f for f in files if f.endswith('.zip')])
+            configured = self.backup_path.get().strip()
+            backup_path, zip_files = self._find_backup_dir(sftp, configured)
 
             if not zip_files:
-                raise Exception("No backup files found")
+                tried = ", ".join(self._candidate_paths(configured))
+                raise Exception(
+                    "No backup ZIP files found. Checked: " + tried + ".\n"
+                    "Enable Automatic Backups under Settings -> System -> Backups "
+                    "in the UniFi Protect UI, then wait for the nightly run."
+                )
+
+            if backup_path != configured:
+                self.root.after(0, lambda fp=backup_path: self.backup_path.set(fp))
+                self.root.after(0, lambda fp=backup_path: self.log_message(
+                    f"Using backup directory: {fp} (path updated)"))
 
             latest_backup = zip_files[-1]
             remote_file = f"{backup_path}/{latest_backup}"
@@ -496,21 +583,21 @@ class UniFiProtectBackupGUI:
                 f"Backup complete! {total} devices saved.", "green"
             ))
 
-            summary = f"Total: {total} devices ({self.devices_found['cameras']} cameras, " \
-                      f"{self.devices_found['bridges']} bridges, " \
-                      f"{self.devices_found['lights']} lights, " \
-                      f"{self.devices_found['speakers']} speakers)"
-            self.root.after(0, lambda: self.summary_label.configure(text=summary))
+            # Build the per-type breakdown generically so new device types
+            # always appear without code changes.
+            present = [(dt, self.devices_found[dt]) for dt in DEVICE_FILES
+                       if self.devices_found.get(dt, 0) > 0]
+            summary = f"Total: {total} devices (" + \
+                      ", ".join(f"{c} {dt}" for dt, c in present) + ")"
+            self.root.after(0, lambda s=summary: self.summary_label.configure(text=s))
 
-            self.root.after(0, lambda: messagebox.showinfo(
+            breakdown = "\n".join(f"- {dt.title()}: {c}" for dt, c in present)
+            self.root.after(0, lambda t=total, b=breakdown, o=output_file: messagebox.showinfo(
                 "Backup Complete",
                 f"Successfully backed up recovery codes!\n\n"
-                f"Total devices: {total}\n"
-                f"- Cameras: {self.devices_found['cameras']}\n"
-                f"- Bridges: {self.devices_found['bridges']}\n"
-                f"- Lights: {self.devices_found['lights']}\n"
-                f"- Speakers: {self.devices_found['speakers']}\n\n"
-                f"Saved to:\n{output_file}"
+                f"Total devices: {t}\n"
+                f"{b}\n\n"
+                f"Saved to:\n{o}"
             ))
 
         except Exception as e:
@@ -521,64 +608,17 @@ class UniFiProtectBackupGUI:
             self.root.after(0, lambda: self.set_ui_state(True))
 
     def extract_recovery_codes(self, backup_file):
-        """Extract recovery codes from a UniFi Protect backup ZIP file"""
-        devices = {
-            'cameras': [],
-            'bridges': [],
-            'lights': [],
-            'speakers': []
-        }
+        """Extract recovery codes for every device type in a Protect backup ZIP"""
+        devices = {k: [] for k in DEVICE_FILES}
 
         try:
             with zipfile.ZipFile(backup_file, 'r') as zip_ref:
-                # Extract cameras
-                if 'cameras.json' in zip_ref.namelist():
-                    cameras_data = json.loads(zip_ref.read('cameras.json'))
-                    for cam in cameras_data:
-                        devices['cameras'].append({
-                            'name': cam.get('name', 'Unknown'),
-                            'model': cam.get('type', 'Unknown'),
-                            'mac': cam.get('mac', 'N/A'),
-                            'ip': cam.get('host', 'N/A'),
-                            'recovery_code': cam.get('password', 'N/A')
-                        })
-
-                # Extract bridges
-                if 'bridges.json' in zip_ref.namelist():
-                    bridges_data = json.loads(zip_ref.read('bridges.json'))
-                    for bridge in bridges_data:
-                        devices['bridges'].append({
-                            'name': bridge.get('name', 'Unknown'),
-                            'model': bridge.get('type', 'Unknown'),
-                            'mac': bridge.get('mac', 'N/A'),
-                            'ip': bridge.get('host', 'N/A'),
-                            'recovery_code': bridge.get('password', 'N/A')
-                        })
-
-                # Extract lights
-                if 'lights.json' in zip_ref.namelist():
-                    lights_data = json.loads(zip_ref.read('lights.json'))
-                    for light in lights_data:
-                        devices['lights'].append({
-                            'name': light.get('name', 'Unknown'),
-                            'model': light.get('type', 'Unknown'),
-                            'mac': light.get('mac', 'N/A'),
-                            'ip': light.get('host', 'N/A'),
-                            'recovery_code': light.get('password', 'N/A')
-                        })
-
-                # Extract speakers
-                if 'speakers.json' in zip_ref.namelist():
-                    speakers_data = json.loads(zip_ref.read('speakers.json'))
-                    for speaker in speakers_data:
-                        devices['speakers'].append({
-                            'name': speaker.get('name', 'Unknown'),
-                            'model': speaker.get('type', 'Unknown'),
-                            'mac': speaker.get('mac', 'N/A'),
-                            'ip': speaker.get('host', 'N/A'),
-                            'recovery_code': speaker.get('password', 'N/A')
-                        })
-
+                names = zip_ref.namelist()
+                for dtype, fname in DEVICE_FILES.items():
+                    if fname not in names:
+                        continue
+                    for d in json.loads(zip_ref.read(fname)):
+                        devices[dtype].append(device_record(d))
         except Exception as e:
             self.root.after(0, lambda: self.log_message(f"Error reading backup: {e}"))
             return None
