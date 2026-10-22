@@ -1,0 +1,13 @@
+[tool.ruff]
+line-length = 120
+target-version = "py38"
+
+[tool.ruff.lint]
+# pyflakes + pycodestyle errors/warnings + bugbear
+select = ["E", "F", "W", "B"]
+ignore = [
+    "E501",  # long UI strings / messages are fine
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
