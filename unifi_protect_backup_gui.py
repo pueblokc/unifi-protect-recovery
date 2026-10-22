@@ -171,6 +171,8 @@ def csv_safe(value):
 def write_csv(devices, output_file):
     """Write recovery codes to CSV, readable only by the current user."""
     fd = os.open(str(output_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    if hasattr(os, 'fchmod'):
+        os.fchmod(fd, 0o600)  # also tighten a pre-existing file
     with os.fdopen(fd, 'w', newline='', encoding='utf-8') as csvfile:
         fieldnames = ['Type', 'Name', 'Model', 'MAC', 'IP', 'Recovery Code']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
