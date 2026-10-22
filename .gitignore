@@ -29,3 +29,10 @@ docs-local-only/
 
 # Search/debug outputs
 *_results.txt
+
+# SSH host keys remembered by the Python GUI (trust-on-first-use)
+known_hosts
+
+# Python tooling
+.pytest_cache/
+.ruff_cache/

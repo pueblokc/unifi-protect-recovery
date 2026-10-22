@@ -21,6 +21,8 @@ import json
 import zipfile
 import os
 import csv
+import re
+import stat
 import threading
 import tempfile
 from datetime import datetime
@@ -35,6 +37,10 @@ except ImportError:
 
 # Configuration file location
 CONFIG_FILE = Path(__file__).parent / "config.json"
+# SSH host keys seen on first connect (trust-on-first-use). A later key
+# mismatch for the same NVR aborts the connection instead of silently
+# sending the root password to whoever answered.
+KNOWN_HOSTS_FILE = Path(__file__).parent / "known_hosts"
 DEFAULT_BACKUP_PATH = "/srv/unifi-protect/backups"
 
 # UniFi Protect writes its automatic backups to different locations depending on
@@ -71,6 +77,145 @@ def device_record(d):
         'ip': d.get('host') or 'N/A',
         'recovery_code': d.get('password') or 'N/A',
     }
+
+
+# Protect backups are named unifi_protect_backup.v<ver>.<YYYYMMDD[HHMMSS]>.zip.
+# The version comes *before* the timestamp, so a plain name sort is wrong
+# (v6.10 < v6.9, and a downgrade sorts below older backups). Sort on the
+# trailing timestamp, then the file mtime, then the name.
+_BACKUP_TS_RE = re.compile(r'(\d{8,14})\.zip$', re.IGNORECASE)
+
+
+def backup_sort_key(name, mtime=0):
+    m = _BACKUP_TS_RE.search(name)
+    ts = m.group(1).ljust(14, '0') if m else ''
+    return (ts, mtime or 0, name)
+
+
+def candidate_paths(configured_path):
+    """Configured path first, then the known fallback locations (de-duped)."""
+    paths = []
+    if configured_path:
+        paths.append(configured_path)
+    for p in CANDIDATE_BACKUP_PATHS:
+        if p not in paths:
+            paths.append(p)
+    return paths
+
+
+def find_backup_dir(sftp, configured_path):
+    """Probe the configured path, then fall back through known locations.
+
+    Returns (path, zip_files) with zip_files ordered oldest -> newest:
+      - (path, [..zips..]) when a directory containing .zip backups is found
+      - (first_existing_dir, [])  when a backup dir exists but holds no zips
+      - (None, [])  when none of the candidate directories exist at all
+    """
+    first_existing = None
+    for path in candidate_paths(configured_path):
+        try:
+            entries = sftp.listdir_attr(path)
+        except IOError:
+            continue  # directory does not exist on this console; try next
+        if first_existing is None:
+            first_existing = path
+        zips = [e for e in entries
+                if e.filename.lower().endswith('.zip')
+                and not stat.S_ISDIR(e.st_mode or 0)]
+        if zips:
+            zips.sort(key=lambda e: backup_sort_key(e.filename, e.st_mtime))
+            return path, [e.filename for e in zips]
+    return first_existing, []
+
+
+def _find_member(names, fname):
+    """Exact top-level match first, else the first entry with that basename
+    (in case a firmware nests the JSON files in a folder)."""
+    if fname in names:
+        return fname
+    for n in names:
+        if n.rsplit('/', 1)[-1] == fname:
+            return n
+    return None
+
+
+def extract_devices(backup_file):
+    """Read every device type's recovery codes from a Protect backup ZIP.
+    Raises on a corrupt/unreadable backup."""
+    devices = {k: [] for k in DEVICE_FILES}
+    with zipfile.ZipFile(backup_file, 'r') as zip_ref:
+        names = zip_ref.namelist()
+        for dtype, fname in DEVICE_FILES.items():
+            member = _find_member(names, fname)
+            if member is None:
+                continue
+            data = json.loads(zip_ref.read(member))
+            if isinstance(data, dict):
+                data = [data]
+            for d in data:
+                if isinstance(d, dict):
+                    devices[dtype].append(device_record(d))
+    return devices
+
+
+def csv_safe(value):
+    """Neutralise spreadsheet formula injection for free-text columns
+    (device names come from the NVR and the CSV is meant to be opened in
+    Excel). Recovery codes/MACs/IPs are never altered."""
+    value = str(value)
+    if value and value[0] in ('=', '+', '-', '@', '\t', '\r'):
+        return "'" + value
+    return value
+
+
+def write_csv(devices, output_file):
+    """Write recovery codes to CSV, readable only by the current user."""
+    fd = os.open(str(output_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w', newline='', encoding='utf-8') as csvfile:
+        fieldnames = ['Type', 'Name', 'Model', 'MAC', 'IP', 'Recovery Code']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
+        writer.writeheader()
+        for device_type, device_list in devices.items():
+            for device in device_list:
+                writer.writerow({
+                    'Type': device_type.rstrip('s').title(),
+                    'Name': csv_safe(device['name']),
+                    'Model': csv_safe(device['model']),
+                    'MAC': device['mac'],
+                    'IP': device['ip'],
+                    'Recovery Code': device['recovery_code']
+                })
+
+
+def make_ssh_client(known_hosts_file=KNOWN_HOSTS_FILE):
+    """SSH client with trust-on-first-use host keys.
+
+    Unknown hosts are accepted and remembered in `known_hosts_file`; a host
+    whose key later changes raises paramiko.BadHostKeyException. Keys in the
+    user's ~/.ssh/known_hosts are honoured too."""
+    ssh = paramiko.SSHClient()
+    try:
+        ssh.load_system_host_keys()
+    except Exception:
+        pass
+    try:
+        Path(known_hosts_file).touch(mode=0o600, exist_ok=True)
+        ssh.load_host_keys(str(known_hosts_file))
+    except Exception:
+        pass  # read-only install dir: fall back to in-memory TOFU
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    return ssh
+
+
+def host_key_error_message(host, known_hosts_file=KNOWN_HOSTS_FILE):
+    return (
+        f"The SSH host key for {host} has CHANGED since the last connection.\n\n"
+        "This happens after replacing/factory-resetting the NVR, but it can "
+        "also mean someone is intercepting the connection. Nothing was sent.\n\n"
+        f"If the change is expected, delete the line for {host} from:\n"
+        f"{known_hosts_file}\n(and ~/.ssh/known_hosts if present), then retry."
+    )
 
 
 class UniFiProtectBackupGUI:
@@ -343,6 +488,23 @@ class UniFiProtectBackupGUI:
         else:
             self.progress.start(10)
 
+    def _snapshot_inputs(self):
+        """Read Tk variables on the main thread; worker threads must not
+        touch Tk objects (tkinter is not thread-safe)."""
+        return {
+            'host': self.nvr_ip.get().strip(),
+            'username': self.username.get().strip(),
+            'password': self.password.get(),
+            'backup_path': self.backup_path.get().strip(),
+            'save_location': self.save_location.get().strip(),
+        }
+
+    def _ui(self, func, *args):
+        """Schedule func(*args) on the Tk main loop from a worker thread.
+        Arguments are bound now, so callers never close over loop or
+        exception variables that change/vanish before the callback runs."""
+        self.root.after(0, lambda: func(*args))
+
     def test_connection(self):
         """Test SSH connection to NVR"""
         if not PARAMIKO_AVAILABLE:
@@ -352,65 +514,51 @@ class UniFiProtectBackupGUI:
         if not self.validate_inputs():
             return
 
+        if self.is_running:
+            return
+        self.is_running = True
+
+        params = self._snapshot_inputs()
         self.clear_results()
         self.set_ui_state(False)
         self.update_status("Testing connection...", "blue")
 
         # Run in background thread
-        thread = threading.Thread(target=self._test_connection_thread)
+        thread = threading.Thread(target=self._test_connection_thread, args=(params,))
         thread.daemon = True
         thread.start()
 
     def _candidate_paths(self, configured_path):
         """Configured path first, then the known fallback locations (de-duped)."""
-        paths = []
-        if configured_path:
-            paths.append(configured_path)
-        for p in CANDIDATE_BACKUP_PATHS:
-            if p not in paths:
-                paths.append(p)
-        return paths
+        return candidate_paths(configured_path)
 
     def _find_backup_dir(self, sftp, configured_path):
-        """Probe the configured path, then fall back through known locations.
+        """See module-level find_backup_dir()."""
+        return find_backup_dir(sftp, configured_path)
 
-        Returns (path, zip_files):
-          - (path, [..zips..]) when a directory containing .zip backups is found
-          - (first_existing_dir, [])  when a backup dir exists but holds no zips
-          - (None, [])  when none of the candidate directories exist at all
-        """
-        first_existing = None
-        for path in self._candidate_paths(configured_path):
-            try:
-                files = sftp.listdir(path)
-            except IOError:
-                continue  # directory does not exist on this console; try next
-            if first_existing is None:
-                first_existing = path
-            zip_files = sorted([f for f in files if f.endswith('.zip')])
-            if zip_files:
-                return path, zip_files
-        return first_existing, []
+    def _finish(self):
+        self.is_running = False
+        self.set_ui_state(True)
 
-    def _test_connection_thread(self):
+    def _test_connection_thread(self, params):
         """Background thread for connection test"""
+        host = params['host']
+        ssh = None
         try:
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
+            ssh = make_ssh_client()
             ssh.connect(
-                self.nvr_ip.get().strip(),
-                username=self.username.get().strip(),
-                password=self.password.get(),
+                host,
+                username=params['username'],
+                password=params['password'],
                 timeout=10
             )
 
             # Probe the configured path, then known fallback locations
             sftp = ssh.open_sftp()
-            configured = self.backup_path.get().strip()
+            configured = params['backup_path']
             tried = self._candidate_paths(configured)
 
-            self.root.after(0, lambda: self.log_message(f"Connected to {self.nvr_ip.get()}"))
+            self._ui(self.log_message, f"Connected to {host}")
 
             try:
                 found_path, zip_files = self._find_backup_dir(sftp, configured)
@@ -419,59 +567,54 @@ class UniFiProtectBackupGUI:
                     latest = zip_files[-1]
                     if found_path != configured:
                         # Found backups somewhere other than the configured path
-                        self.root.after(0, lambda fp=found_path: self.backup_path.set(fp))
-                        self.root.after(0, lambda fp=found_path: self.log_message(
-                            f"Backups found in {fp} (path updated)"))
-                    self.root.after(0, lambda fp=found_path: self.log_message(f"Backup directory: {fp}"))
-                    self.root.after(0, lambda n=len(zip_files): self.log_message(f"Found {n} backup file(s)"))
-                    self.root.after(0, lambda l=latest: self.log_message(f"Latest backup: {l}"))
-                    self.root.after(0, lambda: self.update_status("Connection successful!", "green"))
-                    self.root.after(0, lambda fp=found_path, n=len(zip_files), l=latest: messagebox.showinfo(
-                        "Success",
-                        f"Connection successful!\n\nFound {n} backup file(s) in:\n{fp}\nLatest: {l}"
-                    ))
+                        self._ui(self.backup_path.set, found_path)
+                        self._ui(self.log_message, f"Backups found in {found_path} (path updated)")
+                    self._ui(self.log_message, f"Backup directory: {found_path}")
+                    self._ui(self.log_message, f"Found {len(zip_files)} backup file(s)")
+                    self._ui(self.log_message, f"Latest backup: {latest}")
+                    self._ui(self.update_status, "Connection successful!", "green")
+                    self._ui(messagebox.showinfo, "Success",
+                             f"Connection successful!\n\nFound {len(zip_files)} backup file(s) in:\n"
+                             f"{found_path}\nLatest: {latest}")
                 elif found_path is not None:
                     # A backup directory exists but contains no .zip files
-                    self.root.after(0, lambda: self.update_status("Connected, but no backups found", "orange"))
-                    self.root.after(0, lambda fp=found_path: self.log_message(
-                        f"Backup directory {fp} exists but contains no .zip files"))
-                    self.root.after(0, lambda t=tried: messagebox.showwarning(
-                        "No backups found",
-                        "Connected successfully, but no backup ZIP files were found.\n\n"
-                        "Paths checked:\n  " + "\n  ".join(t) + "\n\n"
-                        "Most likely automatic backups are not enabled yet. In the UniFi "
-                        "Protect web UI go to:\n"
-                        "  Settings -> System -> Backups\n"
-                        "enable Automatic Backups, then wait for the nightly run (~midnight)."
-                    ))
+                    self._ui(self.update_status, "Connected, but no backups found", "orange")
+                    self._ui(self.log_message,
+                             f"Backup directory {found_path} exists but contains no .zip files")
+                    self._ui(messagebox.showwarning, "No backups found",
+                             "Connected successfully, but no backup ZIP files were found.\n\n"
+                             "Paths checked:\n  " + "\n  ".join(tried) + "\n\n"
+                             "Most likely automatic backups are not enabled yet. In the UniFi "
+                             "Protect web UI go to:\n"
+                             "  Settings -> System -> Backups\n"
+                             "enable Automatic Backups, then wait for the nightly run (~midnight).")
                 else:
                     # None of the candidate directories exist on this console
-                    self.root.after(0, lambda: self.update_status("Backup directory not found", "red"))
-                    self.root.after(0, lambda t=tried: self.log_message(
-                        "No backup directory found. Checked: " + ", ".join(t)))
-                    self.root.after(0, lambda t=tried: messagebox.showerror(
-                        "Backup directory not found",
-                        "Connected, but no UniFi Protect backup directory was found.\n\n"
-                        "Paths checked:\n  " + "\n  ".join(t) + "\n\n"
-                        "If your console stores backups elsewhere, set the correct path in "
-                        "the 'Backup path' field. Otherwise enable Automatic Backups under "
-                        "Settings -> System -> Backups in the Protect UI."
-                    ))
+                    self._ui(self.update_status, "Backup directory not found", "red")
+                    self._ui(self.log_message, "No backup directory found. Checked: " + ", ".join(tried))
+                    self._ui(messagebox.showerror, "Backup directory not found",
+                             "Connected, but no UniFi Protect backup directory was found.\n\n"
+                             "Paths checked:\n  " + "\n  ".join(tried) + "\n\n"
+                             "If your console stores backups elsewhere, set the correct path in "
+                             "the 'Backup path' field. Otherwise enable Automatic Backups under "
+                             "Settings -> System -> Backups in the Protect UI.")
             finally:
                 sftp.close()
-                ssh.close()
 
         except paramiko.AuthenticationException:
-            self.root.after(0, lambda: self.update_status("Authentication failed", "red"))
-            self.root.after(0, lambda: messagebox.showerror(
-                "Error",
-                "Authentication failed.\n\nPlease check your username and password."
-            ))
+            self._ui(self.update_status, "Authentication failed", "red")
+            self._ui(messagebox.showerror, "Error",
+                     "Authentication failed.\n\nPlease check your username and password.")
+        except paramiko.BadHostKeyException:
+            self._ui(self.update_status, "Host key changed - connection refused", "red")
+            self._ui(messagebox.showerror, "Host key mismatch", host_key_error_message(host))
         except Exception as e:
-            self.root.after(0, lambda: self.update_status("Connection failed", "red"))
-            self.root.after(0, lambda: messagebox.showerror("Error", f"Connection failed:\n\n{str(e)}"))
+            self._ui(self.update_status, "Connection failed", "red")
+            self._ui(messagebox.showerror, "Error", f"Connection failed:\n\n{e}")
         finally:
-            self.root.after(0, lambda: self.set_ui_state(True))
+            if ssh is not None:
+                ssh.close()
+            self._ui(self._finish)
 
     def start_backup(self):
         """Start the backup process"""
@@ -482,82 +625,87 @@ class UniFiProtectBackupGUI:
         if not self.validate_inputs():
             return
 
+        if self.is_running:
+            return
+        self.is_running = True
+
         # Save config for next time
         self.save_config()
 
+        params = self._snapshot_inputs()
         self.clear_results()
         self.set_ui_state(False)
         self.update_status("Starting backup...", "blue")
 
         # Run in background thread
-        thread = threading.Thread(target=self._backup_thread)
+        thread = threading.Thread(target=self._backup_thread, args=(params,))
         thread.daemon = True
         thread.start()
 
-    def _backup_thread(self):
+    def _backup_thread(self, params):
         """Background thread for backup operation"""
+        host = params['host']
+        ssh = None
+        tmp_path = None
         try:
             # Connect to NVR
-            self.root.after(0, lambda: self.log_message("Connecting to NVR..."))
+            self._ui(self.log_message, "Connecting to NVR...")
 
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
+            ssh = make_ssh_client()
             ssh.connect(
-                self.nvr_ip.get().strip(),
-                username=self.username.get().strip(),
-                password=self.password.get(),
+                host,
+                username=params['username'],
+                password=params['password'],
                 timeout=30
             )
 
-            self.root.after(0, lambda: self.log_message(f"Connected to {self.nvr_ip.get()}"))
+            self._ui(self.log_message, f"Connected to {host}")
 
             # Find latest backup (probe configured path, then known locations)
             sftp = ssh.open_sftp()
-            configured = self.backup_path.get().strip()
-            backup_path, zip_files = self._find_backup_dir(sftp, configured)
+            try:
+                configured = params['backup_path']
+                backup_path, zip_files = self._find_backup_dir(sftp, configured)
 
-            if not zip_files:
-                tried = ", ".join(self._candidate_paths(configured))
-                raise Exception(
-                    "No backup ZIP files found. Checked: " + tried + ".\n"
-                    "Enable Automatic Backups under Settings -> System -> Backups "
-                    "in the UniFi Protect UI, then wait for the nightly run."
-                )
+                if not zip_files:
+                    tried = ", ".join(self._candidate_paths(configured))
+                    raise Exception(
+                        "No backup ZIP files found. Checked: " + tried + ".\n"
+                        "Enable Automatic Backups under Settings -> System -> Backups "
+                        "in the UniFi Protect UI, then wait for the nightly run."
+                    )
 
-            if backup_path != configured:
-                self.root.after(0, lambda fp=backup_path: self.backup_path.set(fp))
-                self.root.after(0, lambda fp=backup_path: self.log_message(
-                    f"Using backup directory: {fp} (path updated)"))
+                if backup_path != configured:
+                    self._ui(self.backup_path.set, backup_path)
+                    self._ui(self.log_message, f"Using backup directory: {backup_path} (path updated)")
 
-            latest_backup = zip_files[-1]
-            remote_file = f"{backup_path}/{latest_backup}"
+                latest_backup = zip_files[-1]
+                remote_file = f"{backup_path.rstrip('/')}/{latest_backup}"
 
-            self.root.after(0, lambda: self.log_message(f"Found latest backup: {latest_backup}"))
-            self.root.after(0, lambda: self.update_status("Downloading backup file...", "blue"))
+                self._ui(self.log_message, f"Found latest backup: {latest_backup}")
+                self._ui(self.update_status, "Downloading backup file...", "blue")
 
-            # Download to temp file
-            with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as tmp:
-                tmp_path = tmp.name
+                # Download to temp file (the ZIP also holds the NVR's TLS
+                # private key, so it is always removed in `finally`).
+                fd, tmp_path = tempfile.mkstemp(suffix='.zip')
+                os.close(fd)
 
-            self.root.after(0, lambda: self.log_message("Downloading backup file..."))
-            sftp.get(remote_file, tmp_path)
-
-            self.root.after(0, lambda: self.log_message("Download complete"))
-            self.root.after(0, lambda: self.update_status("Extracting recovery codes...", "blue"))
-
-            sftp.close()
+                self._ui(self.log_message, "Downloading backup file...")
+                sftp.get(remote_file, tmp_path)
+            finally:
+                sftp.close()
             ssh.close()
+            ssh = None
+
+            self._ui(self.log_message, "Download complete")
+            self._ui(self.update_status, "Extracting recovery codes...", "blue")
 
             # Extract recovery codes
-            self.root.after(0, lambda: self.log_message("Extracting recovery codes..."))
+            self._ui(self.log_message, "Extracting recovery codes...")
             devices = self.extract_recovery_codes(tmp_path)
 
-            # Clean up temp file
-            os.unlink(tmp_path)
-
-            if not devices:
-                raise Exception("Failed to extract recovery codes")
+            if devices is None:
+                raise Exception("Failed to extract recovery codes (backup file unreadable)")
 
             # Count devices
             total = 0
@@ -566,22 +714,18 @@ class UniFiProtectBackupGUI:
                 self.devices_found[device_type] = count
                 total += count
                 if count > 0:
-                    self.root.after(0, lambda dt=device_type, c=count:
-                        self.log_message(f"  {dt.title()}: {c}"))
+                    self._ui(self.log_message, f"  {device_type.title()}: {count}")
 
             # Save to CSV
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_file = Path(self.save_location.get()) / f"recovery_codes_{timestamp}.csv"
+            save_dir = Path(params['save_location'] or (Path.home() / "Documents"))
+            save_dir.mkdir(parents=True, exist_ok=True)
+            output_file = save_dir / f"recovery_codes_{timestamp}.csv"
 
             self.save_to_csv(devices, str(output_file))
 
-            self.root.after(0, lambda: self.log_message(""))
-            self.root.after(0, lambda: self.log_message(f"Saved to: {output_file}"))
-
-            # Update UI with success
-            self.root.after(0, lambda: self.update_status(
-                f"Backup complete! {total} devices saved.", "green"
-            ))
+            self._ui(self.log_message, "")
+            self._ui(self.log_message, f"Saved to: {output_file}")
 
             # Build the per-type breakdown generically so new device types
             # always appear without code changes.
@@ -589,59 +733,61 @@ class UniFiProtectBackupGUI:
                        if self.devices_found.get(dt, 0) > 0]
             summary = f"Total: {total} devices (" + \
                       ", ".join(f"{c} {dt}" for dt, c in present) + ")"
-            self.root.after(0, lambda s=summary: self.summary_label.configure(text=s))
+            self.root.after(0, lambda: self.summary_label.configure(text=summary))
+
+            if total == 0:
+                self._ui(self.update_status, "Backup read, but it contained no devices", "orange")
+                self._ui(messagebox.showwarning, "No devices found",
+                         "The latest backup was read successfully but contained no "
+                         "device recovery codes.\n\nAn empty CSV was saved to:\n"
+                         f"{output_file}")
+                return
+
+            # Update UI with success
+            self._ui(self.update_status, f"Backup complete! {total} devices saved.", "green")
 
             breakdown = "\n".join(f"- {dt.title()}: {c}" for dt, c in present)
-            self.root.after(0, lambda t=total, b=breakdown, o=output_file: messagebox.showinfo(
-                "Backup Complete",
-                f"Successfully backed up recovery codes!\n\n"
-                f"Total devices: {t}\n"
-                f"{b}\n\n"
-                f"Saved to:\n{o}"
-            ))
+            self._ui(messagebox.showinfo, "Backup Complete",
+                     f"Successfully backed up recovery codes!\n\n"
+                     f"Total devices: {total}\n"
+                     f"{breakdown}\n\n"
+                     f"Saved to:\n{output_file}")
 
+        except paramiko.AuthenticationException:
+            self._ui(self.update_status, "Authentication failed", "red")
+            self._ui(self.log_message, "ERROR: Authentication failed")
+            self._ui(messagebox.showerror, "Backup Failed",
+                     "Authentication failed.\n\nPlease check your username and password.")
+        except paramiko.BadHostKeyException:
+            self._ui(self.update_status, "Host key changed - connection refused", "red")
+            self._ui(self.log_message, "ERROR: NVR host key changed; connection refused")
+            self._ui(messagebox.showerror, "Host key mismatch", host_key_error_message(host))
         except Exception as e:
-            self.root.after(0, lambda: self.update_status("Backup failed", "red"))
-            self.root.after(0, lambda: self.log_message(f"ERROR: {str(e)}"))
-            self.root.after(0, lambda: messagebox.showerror("Backup Failed", str(e)))
+            self._ui(self.update_status, "Backup failed", "red")
+            self._ui(self.log_message, f"ERROR: {e}")
+            self._ui(messagebox.showerror, "Backup Failed", str(e))
         finally:
-            self.root.after(0, lambda: self.set_ui_state(True))
+            if ssh is not None:
+                ssh.close()
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            self._ui(self._finish)
 
     def extract_recovery_codes(self, backup_file):
-        """Extract recovery codes for every device type in a Protect backup ZIP"""
-        devices = {k: [] for k in DEVICE_FILES}
-
+        """Extract recovery codes for every device type in a Protect backup ZIP.
+        Returns None (and logs) if the backup can't be read."""
         try:
-            with zipfile.ZipFile(backup_file, 'r') as zip_ref:
-                names = zip_ref.namelist()
-                for dtype, fname in DEVICE_FILES.items():
-                    if fname not in names:
-                        continue
-                    for d in json.loads(zip_ref.read(fname)):
-                        devices[dtype].append(device_record(d))
+            return extract_devices(backup_file)
         except Exception as e:
-            self.root.after(0, lambda: self.log_message(f"Error reading backup: {e}"))
+            self._ui(self.log_message, f"Error reading backup: {e}")
             return None
 
-        return devices
-
     def save_to_csv(self, devices, output_file):
-        """Save recovery codes to CSV file"""
-        with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['Type', 'Name', 'Model', 'MAC', 'IP', 'Recovery Code']
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-
-            writer.writeheader()
-            for device_type, device_list in devices.items():
-                for device in device_list:
-                    writer.writerow({
-                        'Type': device_type.rstrip('s').title(),
-                        'Name': device['name'],
-                        'Model': device['model'],
-                        'MAC': device['mac'],
-                        'IP': device['ip'],
-                        'Recovery Code': device['recovery_code']
-                    })
+        """Save recovery codes to CSV file (mode 0600)"""
+        write_csv(devices, output_file)
 
 
 def main():
@@ -650,7 +796,7 @@ def main():
     # Set app icon if available
     try:
         root.iconbitmap(default='')
-    except:
+    except Exception:
         pass
 
     # Style configuration
@@ -660,7 +806,7 @@ def main():
     elif 'clam' in style.theme_names():
         style.theme_use('clam')
 
-    app = UniFiProtectBackupGUI(root)
+    UniFiProtectBackupGUI(root)
     root.mainloop()
 
 
