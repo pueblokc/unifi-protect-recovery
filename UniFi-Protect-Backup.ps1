@@ -53,6 +53,7 @@ function Extract-RecoveryCodes {
     foreach ($t in $script:DeviceTypes) { $devices[$t] = @() }
     $validNames = $script:DeviceTypes | ForEach-Object { "$_" + ".json" }
 
+    $zip = $null
     try {
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
@@ -79,12 +80,30 @@ function Extract-RecoveryCodes {
                 }
             }
         }
-        $zip.Dispose()
     } catch {
         throw "Failed to read ZIP file: $_"
+    } finally {
+        if ($zip) { $zip.Dispose() }
     }
 
     return $devices
+}
+
+# Quote a CSV field (RFC 4180: double any embedded quotes). Free-text
+# columns also get a leading ' if they start with a formula character so a
+# hostile device name can't run as an Excel formula. Codes are never altered.
+function ConvertTo-CsvField {
+    param($value, [switch]$FreeText)
+    $s = "$value"
+    if ($FreeText -and $s -match '^[=+\-@\t\r]') { $s = "'" + $s }
+    return '"' + ($s -replace '"', '""') + '"'
+}
+
+# Remote paths are interpolated into a shell command on the NVR; refuse
+# anything that could break out of the single-quoted argument.
+function Test-SafeRemotePath {
+    param($path)
+    return ($path -match '^/[A-Za-z0-9._/\- ]*$')
 }
 
 # Save to CSV
@@ -98,7 +117,14 @@ function Save-ToCSV {
         foreach ($device in $devices[$type]) {
             $typeName = $type.TrimEnd('s')
             $typeName = $typeName.Substring(0,1).ToUpper() + $typeName.Substring(1)
-            $row = "`"$typeName`",`"$($device.name)`",`"$($device.model)`",`"$($device.mac)`",`"$($device.ip)`",`"$($device.recovery_code)`""
+            $row = @(
+                (ConvertTo-CsvField $typeName),
+                (ConvertTo-CsvField $device.name -FreeText),
+                (ConvertTo-CsvField $device.model -FreeText),
+                (ConvertTo-CsvField $device.mac),
+                (ConvertTo-CsvField $device.ip),
+                (ConvertTo-CsvField $device.recovery_code)
+            ) -join ','
             $rows += $row
         }
     }
@@ -322,14 +348,17 @@ $testBtn.Add_Click({
             "/etc/unifi-protect/backups",
             "/data/unifi-core/backups",
             "/data/unifi-protect/backups"
-        ) | Select-Object -Unique
+        ) | Where-Object { $_ } | Select-Object -Unique
+
+        $badPath = $backupPaths | Where-Object { -not (Test-SafeRemotePath $_) } | Select-Object -First 1
+        if ($badPath) { throw "Invalid backup path: '$badPath'. Use an absolute path with letters, digits, . _ - / only." }
 
         $foundPath = $null
         $zipFiles = @()
 
         foreach ($testPath in $backupPaths) {
             Log-Message "Checking $testPath..."
-            $cmd = "ls -1 '$testPath'/*.zip 2>/dev/null | tail -10"
+            $cmd = "ls -t '$testPath'/*.zip 2>/dev/null | head -10"
             $result = echo y | plink -batch -ssh -l $userTextBox.Text -pw $passTextBox.Text $ipTextBox.Text $cmd 2>&1
 
             $files = $result | Where-Object { $_ -match '\.zip$' -and $_ -notmatch 'keyboard-interactive|plink' }
@@ -347,7 +376,8 @@ $testBtn.Add_Click({
             Log-Message "Connection successful!"
             Log-Message "Found $count backup file(s)"
 
-            $latest = $zipFiles | Select-Object -Last 1
+            # ls -t lists newest first
+            $latest = $zipFiles | Select-Object -First 1
             Log-Message "Latest: $(Split-Path $latest -Leaf)"
 
             # Update the path field if we found backups in a different location
@@ -398,6 +428,7 @@ $backupBtn.Add_Click({
     Update-Status "Starting backup..." ([System.Drawing.Color]::Blue)
     $testBtn.Enabled = $false
     $backupBtn.Enabled = $false
+    $tempZip = $null
 
     try {
         Log-Message "Connecting to $($ipTextBox.Text)..."
@@ -409,7 +440,10 @@ $backupBtn.Add_Click({
             "/etc/unifi-protect/backups",
             "/data/unifi-core/backups",
             "/data/unifi-protect/backups"
-        ) | Select-Object -Unique
+        ) | Where-Object { $_ } | Select-Object -Unique
+
+        $badPath = $backupPaths | Where-Object { -not (Test-SafeRemotePath $_) } | Select-Object -First 1
+        if ($badPath) { throw "Invalid backup path: '$badPath'. Use an absolute path with letters, digits, . _ - / only." }
 
         $latestBackup = $null
         foreach ($testPath in $backupPaths) {
@@ -460,9 +494,6 @@ $backupBtn.Add_Click({
 
         # Extract codes
         $devices = Extract-RecoveryCodes $tempZip
-
-        # Clean up temp
-        Remove-Item $tempZip -Force -ErrorAction SilentlyContinue
 
         # Count devices generically across every known device type
         $total = 0
@@ -534,6 +565,11 @@ $backupBtn.Add_Click({
         Update-Status "Backup failed" ([System.Drawing.Color]::Red)
         [System.Windows.Forms.MessageBox]::Show("Backup failed:`n`n$_", "Error", "OK", "Error")
     } finally {
+        # The downloaded ZIP holds every recovery code + the NVR TLS key:
+        # always delete it, including when download/extraction failed.
+        if ($tempZip -and (Test-Path $tempZip)) {
+            Remove-Item $tempZip -Force -ErrorAction SilentlyContinue
+        }
         $testBtn.Enabled = $true
         $backupBtn.Enabled = $true
     }
