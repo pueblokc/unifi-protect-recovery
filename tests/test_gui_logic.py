@@ -107,10 +107,6 @@ def params(tmp_path, **over):
     return p
 
 
-def temp_zips(tmp_path):
-    import tempfile
-    return {f for f in os.listdir(tempfile.gettempdir()) if f.endswith('.zip')}
-
 
 # ------------------------------------------------------------- parity --
 

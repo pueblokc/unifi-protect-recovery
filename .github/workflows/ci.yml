@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    name: Lint + tests (Linux, Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Ruff
+        run: ruff check .
+      - name: ShellCheck
+        run: shellcheck backup_recovery_codes.sh
+      - name: PowerShell syntax check
+        shell: pwsh
+        run: |
+          $failed = $false
+          Get-ChildItem -Recurse -Filter *.ps1 | ForEach-Object {
+            $errs = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errs) | Out-Null
+            if ($errs.Count) { $failed = $true; $errs | ForEach-Object { Write-Host "$($_.Extent.File):$($_.Extent.StartLineNumber) $($_.Message)" } }
+          }
+          if ($failed) { exit 1 }
+      - name: Pytest
+        run: python -m pytest -v
+
+  windows:
+    name: Tests (Windows, PowerShell 5.1 + Python)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Pytest
+        run: python -m pytest -v
+      - name: PowerShell helper checks (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\powershell\Test-Functions.ps1
