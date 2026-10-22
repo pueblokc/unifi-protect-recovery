@@ -64,11 +64,22 @@ python3 extract_recovery_codes.py                          # latest backup, text
 python3 extract_recovery_codes.py /path/to/backup.zip      # specific file, text
 python3 extract_recovery_codes.py /path/to/backup.zip json # JSON output
 python3 extract_recovery_codes.py /path/to/backup.zip csv  # CSV output
+python3 extract_recovery_codes.py /path/to/backup.zip csv /tmp/codes.csv  # CSV to a chosen path
 ```
+
+With no ZIP argument it searches `/srv/unifi-protect/backups`,
+`/etc/unifi-protect/backups`, `/data/unifi-core/backups` and
+`/data/unifi-protect/backups` for the newest backup. Exit status is non-zero on failure.
 
 ### `backup_recovery_codes.sh`
 Finds the latest backup, extracts codes to CSV, creates a dated copy, maintains a
 `recovery_codes_latest.csv` symlink, and prunes backups older than 30 days.
+
+Keep it in the same folder as `extract_recovery_codes.py` (or put the
+extractor at `/root/extract_recovery_codes.py`). Everything it writes is
+owner-only (`umask 077`). If extraction fails it exits non-zero and does
+**not** create a dated copy. Paths can be overridden with environment
+variables: `PROTECT_BACKUP_DIR`, `BACKUP_DIR`, `CSV_FILE`, `RETENTION_DAYS`.
 
 Optional daily cron at 1:00 AM:
 

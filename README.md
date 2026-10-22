@@ -20,7 +20,7 @@
 **Point-and-click backup of UniFi Protect device recovery codes — from _any_ NVR.**
 
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-89b4fa)
-![Python](https://img.shields.io/badge/python-3.6%2B-a6e3a1)
+![Python](https://img.shields.io/badge/python-3.8%2B-a6e3a1)
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-f9e2af)
 ![Made by KCCS](https://img.shields.io/badge/made%20by-KCCS-f38ba8)
@@ -87,7 +87,13 @@ python unifi_protect_backup_gui.py
 python3 extract_recovery_codes.py                          # all codes, text
 python3 extract_recovery_codes.py /path/to/backup.zip csv  # export to CSV
 python3 extract_recovery_codes.py /path/to/backup.zip json # export to JSON
+python3 extract_recovery_codes.py /path/to/backup.zip csv ./codes.csv  # CSV to a chosen path
 ```
+
+With no ZIP argument the newest backup in any of the known backup folders is
+used. CSV output defaults to `/root/unifi_protect_recovery_codes.csv` and is
+created owner-read-only (`0600`). Exit status is non-zero on any failure, so
+it is safe to script.
 
 ---
 
@@ -96,7 +102,7 @@ python3 extract_recovery_codes.py /path/to/backup.zip json # export to JSON
 | Path | Needs |
 |------|-------|
 | PowerShell GUI (`RUN_BACKUP.bat`) | Windows 10/11 (PowerShell 5.1+). [PuTTY](https://www.putty.org/) for SSH transfer. |
-| Python GUI / CLI | [Python 3.6+](https://www.python.org/downloads/) and `paramiko` (`pip install paramiko`). |
+| Python GUI / CLI | [Python 3.8+](https://www.python.org/downloads/) (CI tests 3.9 and 3.13) and `paramiko` 3.4+ (`pip install -r requirements.txt`). The on-NVR CLI needs only the standard library. |
 
 ---
 
@@ -104,14 +110,18 @@ python3 extract_recovery_codes.py /path/to/backup.zip json # export to JSON
 
 ```
  1. UniFi Protect writes an automatic backup .zip nightly (~00:00)
- 2. This tool SSHes in and finds the most recent backup
+ 2. This tool SSHes in and finds the most recent backup (by the timestamp in
+    the file name, then file time — not alphabetically)
         ↳ probes /srv/unifi-protect/backups, /etc/unifi-protect/backups,
           /data/unifi-core/backups, /data/unifi-protect/backups
  3. Downloads it to a temp file
  4. Reads cameras / bridges / lights / speakers / aiports / sirens / viewers .json
         ↳ each device's recovery code lives in its "password" field
- 5. Writes recovery_codes_<timestamp>.csv  ──►  your Save-To folder
- 6. Deletes the temp backup. Nothing is uploaded anywhere.
+ 5. Writes the CSV  ──►  your Save-To folder
+        ↳ Python GUI:      recovery_codes_<timestamp>.csv  (owner-only on macOS/Linux)
+        ↳ PowerShell GUI:  recovery_codes_<NVR hostname>_<MAC last 4>_<timestamp>.csv
+ 6. Deletes the temp backup — also when the download or extraction fails.
+    Nothing is uploaded anywhere.
 ```
 
 ---
@@ -143,6 +153,15 @@ Bridge,Garage,UFP-UAP-B,02005E100003,192.0.2.13,EXAMPLE_CODE_cccccccc
   `*.csv` and `config.json` — keep it that way.
 - Store the CSV in encrypted/secure storage; keep an offline copy for DR.
 - The GUIs **never save your password** — only the IP, username, and paths.
+- **SSH host keys (Python GUI):** the first connection to an NVR remembers its
+  host key in a `known_hosts` file next to the script; if the key later
+  changes the GUI refuses to connect (possible interception) and tells you
+  which line to delete if the change is expected (e.g. replaced NVR).
+- **PowerShell GUI:** PuTTY receives the password via `-pw` on its command
+  line, which other processes on the same PC can read while it runs. Use it
+  on a PC you trust, or prefer the Python GUI.
+- The downloaded backup ZIP also contains the NVR's TLS private key; both GUIs
+  delete it from the temp folder as soon as the codes are extracted.
 - Don't reuse important passwords as device codes, and don't share codes publicly.
 
 ---
@@ -167,6 +186,8 @@ Bridge,Garage,UFP-UAP-B,02005E100003,192.0.2.13,EXAMPLE_CODE_cccccccc
 | `download_latest.ps1` | Pull the latest CSV from the NVR to Windows |
 | `RUN_BACKUP.bat` / `RUN_BACKUP_GUI.bat` / `UPDATE_BACKUP.bat` | Double-click launchers |
 | `SERVER_README.md` | Server-side (on-the-NVR) guide |
+| `ARCHITECTURE.md` | How the pieces fit together (for contributors) |
+| `tests/` | pytest suite + PowerShell helper checks (no NVR needed) |
 | `QUICK_REFERENCE.txt` | One-page cheat sheet |
 
 ---
@@ -180,6 +201,21 @@ Bridge,Garage,UFP-UAP-B,02005E100003,192.0.2.13,EXAMPLE_CODE_cccccccc
 | Connection failed | Check IP / credentials, NVR reachability, and that SSH is enabled. |
 | No backup files found | Enable automatic backups in UniFi Protect; wait for the nightly run. |
 | Recovery code doesn't work | Match the code to the device **MAC**; confirm a clean factory reset. |
+
+| "Host key mismatch" (Python GUI) | The NVR's SSH key changed. If you replaced/reset it, delete its line from `known_hosts` next to the script and retry. |
+
+---
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+ruff check .
+pytest            # fakes SSH/SFTP; no NVR, network or display required
+```
+
+CI (`.github/workflows/ci.yml`) runs ruff, ShellCheck, a PowerShell parse
+check and the tests on Linux and Windows.
 
 ---
 

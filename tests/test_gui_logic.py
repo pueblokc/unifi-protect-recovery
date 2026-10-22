@@ -107,7 +107,6 @@ def params(tmp_path, **over):
     return p
 
 
-
 # ------------------------------------------------------------- parity --
 
 def test_device_tables_match_cli():
